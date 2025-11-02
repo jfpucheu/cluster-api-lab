@@ -1,0 +1,499 @@
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: ClusterClass
+metadata:
+  name: quick-start
+  namespace: default
+spec:
+  controlPlane:
+    healthCheck:
+      checks:
+        unhealthyNodeConditions:
+        - status: Unknown
+          timeoutSeconds: 300
+          type: Ready
+        - status: "False"
+          timeoutSeconds: 300
+          type: Ready
+    machineInfrastructure:
+      templateRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: DockerMachineTemplate
+        name: quick-start-control-plane
+    templateRef:
+      apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+      kind: KubeadmControlPlaneTemplate
+      name: quick-start-control-plane
+  infrastructure:
+    templateRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      kind: DockerClusterTemplate
+      name: quick-start-cluster
+  patches:
+  - definitions:
+    - jsonPatches:
+      - op: add
+        path: /spec/template/spec/kubeadmConfigSpec/clusterConfiguration/imageRepository
+        valueFrom:
+          variable: imageRepository
+      selector:
+        apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+        kind: KubeadmControlPlaneTemplate
+        matchResources:
+          controlPlane: true
+    description: Sets the imageRepository used for the KubeadmControlPlane.
+    enabledIf: '{{ ne .imageRepository "" }}'
+    name: imageRepository
+  - definitions:
+    - jsonPatches:
+      - op: add
+        path: /spec/template/spec/kubeadmConfigSpec/clusterConfiguration/etcd
+        valueFrom:
+          template: |
+            local:
+              imageTag: {{ .etcdImageTag }}
+      selector:
+        apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+        kind: KubeadmControlPlaneTemplate
+        matchResources:
+          controlPlane: true
+    description: Sets tag to use for the etcd image in the KubeadmControlPlane.
+    enabledIf: '{{ ne .etcdImageTag "" }}'
+    name: etcdImageTag
+  - definitions:
+    - jsonPatches:
+      - op: add
+        path: /spec/template/spec/kubeadmConfigSpec/clusterConfiguration/dns
+        valueFrom:
+          template: |
+            imageTag: {{ .coreDNSImageTag }}
+      selector:
+        apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+        kind: KubeadmControlPlaneTemplate
+        matchResources:
+          controlPlane: true
+    description: Sets tag to use for the etcd image in the KubeadmControlPlane.
+    enabledIf: '{{ ne .coreDNSImageTag "" }}'
+    name: coreDNSImageTag
+  - definitions:
+    - jsonPatches:
+      - op: add
+        path: /spec/template/spec/customImage
+        valueFrom:
+          template: |
+            kindest/node:{{ .builtin.machineDeployment.version | replace "+" "_" }}
+      selector:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: DockerMachineTemplate
+        matchResources:
+          machineDeploymentClass:
+            names:
+            - default-worker
+    - jsonPatches:
+      - op: add
+        path: /spec/template/spec/template/customImage
+        valueFrom:
+          template: |
+            kindest/node:{{ .builtin.machinePool.version | replace "+" "_" }}
+      selector:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: DockerMachinePoolTemplate
+        matchResources:
+          machinePoolClass:
+            names:
+            - default-worker
+    - jsonPatches:
+      - op: add
+        path: /spec/template/spec/customImage
+        valueFrom:
+          template: |
+            kindest/node:{{ .builtin.controlPlane.version | replace "+" "_" }}
+      selector:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: DockerMachineTemplate
+        matchResources:
+          controlPlane: true
+    description: Sets the container image that is used for running dockerMachines
+      for the controlPlane and default-worker machineDeployments.
+    name: customImage
+  - definitions:
+    - jsonPatches:
+      - op: add
+        path: /spec/template/spec/kubeadmConfigSpec/clusterConfiguration/apiServer/extraArgs
+        value:
+        - name: admission-control-config-file
+          value: /etc/kubernetes/kube-apiserver-admission-pss.yaml
+      - op: add
+        path: /spec/template/spec/kubeadmConfigSpec/clusterConfiguration/apiServer/extraVolumes
+        value:
+        - hostPath: /etc/kubernetes/kube-apiserver-admission-pss.yaml
+          mountPath: /etc/kubernetes/kube-apiserver-admission-pss.yaml
+          name: admission-pss
+          pathType: File
+          readOnly: true
+      - op: add
+        path: /spec/template/spec/kubeadmConfigSpec/files
+        valueFrom:
+          template: |
+            - content: |
+                apiVersion: apiserver.config.k8s.io/v1
+                kind: AdmissionConfiguration
+                plugins:
+                - name: PodSecurity
+                  configuration:
+                    apiVersion: pod-security.admission.config.k8s.io/v1{{ if semverCompare "< v1.25-0" .builtin.controlPlane.version }}beta1{{ end }}
+                    kind: PodSecurityConfiguration
+                    defaults:
+                      enforce: "{{ .podSecurityStandard.enforce }}"
+                      enforce-version: "latest"
+                      audit: "{{ .podSecurityStandard.audit }}"
+                      audit-version: "latest"
+                      warn: "{{ .podSecurityStandard.warn }}"
+                      warn-version: "latest"
+                    exemptions:
+                      usernames: []
+                      runtimeClasses: []
+                      namespaces: [kube-system]
+              path: /etc/kubernetes/kube-apiserver-admission-pss.yaml
+            - path: /etc/kubernetes/etcd_migration.sh
+              owner: "root:root"
+              permissions: "0744"
+              content: |
+                #!/bin/bash
+                set -euo pipefail
+
+                # Configuration
+                readonly ETCD_VER="v3.5.21"
+                readonly ETCD_URL="https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz"
+                readonly KUBEADM_FILE="/run/kubeadm/kubeadm.yaml"
+
+                log() { echo -e "\033[0;32m✅ $1\033[0m"; }
+                err() { echo -e "\033[0;31m❌ $1\033[0m" >&2; exit "${2:-1}"; }
+                step() { echo -e "\n\033[1;33m==> $1\033[0m"; }
+
+                validate_ip() {
+                    [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || err "IP invalide"
+                    local IFS='.'; read -ra O <<< "$1"
+                    for o in "${O[@]}"; do ((o <= 255)) || err "Octet IP > 255"; done
+                }
+
+                setup_env() {
+                    export ETCDCTL_API=3 ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt \
+                          ETCDCTL_CERT=/tmp/etcd-client.crt ETCDCTL_KEY=/tmp/etcd-client.key
+                }
+
+                gen_certs() {
+                    step "Génération certificats"
+                    ETCDCTL_CACERT_KEY=/etc/kubernetes/pki/etcd/ca.key 
+                    openssl genrsa -out $ETCDCTL_KEY 2048 2>/dev/null
+                    openssl req -new -key $ETCDCTL_KEY -out /tmp/etcd-client.csr -subj "/CN=etcd-client" 2>/dev/null
+                    openssl x509 -req -in /tmp/etcd-client.csr -CA $ETCDCTL_CACERT -CAkey $ETCDCTL_CACERT_KEY \
+                        -CAcreateserial -out $ETCDCTL_CERT -days 1 -sha256 2>/dev/null
+                    log "Certificats OK"
+                }
+
+                install_etcd() {
+                    command -v etcdctl &>/dev/null && [[ $(etcdctl version | head -n1 | awk '{print $3}') == "$ETCD_VER" ]] && return
+                    step "Installation etcdctl ${ETCD_VER}"
+                    curl -fsSL "$ETCD_URL" -o /tmp/etcd.tar.gz || err "Téléchargement échoué"
+                    tar xzf /tmp/etcd.tar.gz -C /usr/local/bin --strip-components=1 "etcd-${ETCD_VER}-linux-amd64/etcdctl" "etcd-${ETCD_VER}-linux-amd64/etcd"
+                    rm -f /tmp/etcd.tar.gz
+                    log "etcd installé"
+                }
+
+                prekubeadm() {
+                    [[ -f "$KUBEADM_FILE" ]] || { echo "Pas de $KUBEADM_FILE (normal si pas 1er CP)"; return 0; }
+                    step "Pré-kubeadm avec IP: $1"
+                    gen_certs
+                    install_etcd
+                    
+                    local ip=$(hostname -I | awk '{print $1}')
+                    local hn=$(hostname)
+                    
+                    step "Ajout membre etcd"
+                    etcdctl --endpoints="https://$1:2379" member add "$hn" --peer-urls="https://${ip}:2380" || err "Ajout membre échoué"
+                    
+                    sed -i "/initial-cluster-state:/a\      initial-cluster: nodeold=https://$1:2380,${hn}=https://${ip}:2380" "$KUBEADM_FILE"
+                    log "Config pré-kubeadm OK. Démarrez kubeadm maintenant"
+                }
+
+                postkubeadm() {
+                    [[ -f "$KUBEADM_FILE" ]] || { echo "Pas de $KUBEADM_FILE (normal si pas 1er CP)"; return 0; }
+                    step "Post-kubeadm avec IP: $1"
+                    
+                    local ip=$(hostname -I | awk '{print $1}')
+                    local le="https://${ip}:2379"
+                    local ep="https://$1:2379,${le}"
+                    
+                    step "Nettoyage ConfigMap"
+                    kubectl get cm -n kube-system kubeadm-config -o yaml > /tmp/kubeadm-config.yaml
+                    sed -i '/^[[:space:]]*initial-cluster:/d' /tmp/kubeadm-config.yaml
+                    kubectl apply -f /tmp/kubeadm-config.yaml
+                    
+                    step "État cluster"
+                    etcdctl --endpoints="$ep" endpoint status --write-out=table
+                    
+                    local lid=$(etcdctl --endpoints="$ep" endpoint status --write-out=simple | awk -F, '$5==" true"{print $2}'  | tr -d ' ')
+                    local oid=$(etcdctl --endpoints="$le" endpoint status --write-out=simple | awk -F, '{print $2}'  | tr -d ' ')
+                    
+                    echo "Local ID: $oid | Leader ID: $lid"
+                    
+                    if [[ "$lid" != "$oid" ]]; then
+                        step "Transfert leadership"
+                        etcdctl --endpoints="$ep" move-leader "$oid" || err "Transfert échoué"
+                        sleep 2
+                        etcdctl --endpoints="$ep" endpoint status --write-out=table
+                    fi
+                    
+                    step "Suppression ancien membre"
+                    etcdctl --endpoints="$ep" member remove "$lid" || err "Suppression échouée"
+                    etcdctl --endpoints="$ep" endpoint status --write-out=table
+                    log "Migration terminée"
+                }
+
+                main() {
+                    [[ $# -eq 2 ]] || err "Usage: $0 [prekubeadm|postkubeadm] <IP>"
+                    [[ $EUID -eq 0 ]] || err "Exécuter en root"
+                    
+                    validate_ip "$2"
+                    setup_env
+                    
+                    case "$1" in
+                        prekubeadm) prekubeadm "$2" ;;
+                        postkubeadm) postkubeadm "$2" ;;
+                        *) err "Option invalide. Utilisez 'prekubeadm' ou 'postkubeadm'" 4 ;;
+                    esac
+                    
+                    log "Script terminé"
+                }
+                main "$@"
+      selector:
+        apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+        kind: KubeadmControlPlaneTemplate
+        matchResources:
+          controlPlane: true
+    description: Adds an admission configuration for PodSecurity to the kube-apiserver.
+    enabledIf: '{{ .podSecurityStandard.enabled }}'
+    name: podSecurityStandard
+  variables:
+  - name: imageRepository
+    required: true
+    schema:
+      openAPIV3Schema:
+        default: ""
+        description: imageRepository sets the container registry to pull images from.
+          If empty, nothing will be set and the from of kubeadm will be used.
+        example: registry.k8s.io
+        type: string
+  - name: etcdImageTag
+    required: true
+    schema:
+      openAPIV3Schema:
+        default: ""
+        description: etcdImageTag sets the tag for the etcd image.
+        example: 3.5.3-0
+        type: string
+  - name: coreDNSImageTag
+    required: true
+    schema:
+      openAPIV3Schema:
+        default: ""
+        description: coreDNSImageTag sets the tag for the coreDNS image.
+        example: v1.8.5
+        type: string
+  - name: podSecurityStandard
+    required: false
+    schema:
+      openAPIV3Schema:
+        properties:
+          audit:
+            default: restricted
+            description: audit sets the level for the audit PodSecurityConfiguration
+              mode. One of privileged, baseline, restricted.
+            type: string
+          enabled:
+            default: true
+            description: enabled enables the patches to enable Pod Security Standard
+              via AdmissionConfiguration.
+            type: boolean
+          enforce:
+            default: baseline
+            description: enforce sets the level for the enforce PodSecurityConfiguration
+              mode. One of privileged, baseline, restricted.
+            type: string
+          warn:
+            default: restricted
+            description: warn sets the level for the warn PodSecurityConfiguration
+              mode. One of privileged, baseline, restricted.
+            type: string
+        type: object
+  workers:
+    machineDeployments:
+    - bootstrap:
+        templateRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+          kind: KubeadmConfigTemplate
+          name: quick-start-default-worker-bootstraptemplate
+      class: default-worker
+      healthCheck:
+        checks:
+          unhealthyNodeConditions:
+          - status: Unknown
+            timeoutSeconds: 300
+            type: Ready
+          - status: "False"
+            timeoutSeconds: 300
+            type: Ready
+      infrastructure:
+        templateRef:
+          apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+          kind: DockerMachineTemplate
+          name: quick-start-default-worker-machinetemplate
+    machinePools:
+    - bootstrap:
+        templateRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+          kind: KubeadmConfigTemplate
+          name: quick-start-default-worker-bootstraptemplate
+      class: default-worker
+      infrastructure:
+        templateRef:
+          apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+          kind: DockerMachinePoolTemplate
+          name: quick-start-default-worker-machinepooltemplate
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: DockerClusterTemplate
+metadata:
+  name: quick-start-cluster
+  namespace: default
+spec:
+  template:
+    spec: {}
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KubeadmControlPlaneTemplate
+metadata:
+  name: quick-start-control-plane
+  namespace: default
+spec:
+  template:
+    spec:
+      kubeadmConfigSpec:
+        clusterConfiguration:
+          featureGates:
+            EtcdLearnerMode: true
+          apiServer:
+            certSANs:
+            - localhost
+            - 127.0.0.1
+            - 0.0.0.0
+            - host.docker.internal
+          etcd:
+            local:
+              extraArgs:
+                - name: initial-cluster-state
+                  value: existing
+        preKubeadmCommands:
+          - ./etc/kubernetes/etcd_migration.sh prekubeadm 172.18.0.3 >> /tmp/initlogs 2>&1
+        postKubeadmCommands:
+          - ./etc/kubernetes/etcd_migration.sh postkubeadm 172.18.0.3 >> /tmp/initlogs 2>&1
+          - kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/tigera-operator.yaml
+          - sleep 5
+          - kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/custom-resources.yaml
+        initConfiguration:
+          nodeRegistration:
+            kubeletExtraArgs:
+            - name: eviction-hard
+              value: nodefs.available<0%,nodefs.inodesFree<0%,imagefs.available<0%
+        joinConfiguration:
+          nodeRegistration:
+            kubeletExtraArgs:
+            - name: eviction-hard
+              value: nodefs.available<0%,nodefs.inodesFree<0%,imagefs.available<0%
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: DockerMachineTemplate
+metadata:
+  name: quick-start-control-plane
+  namespace: default
+spec:
+  template:
+    spec:
+      extraMounts:
+      - containerPath: /var/run/docker.sock
+        hostPath: /var/run/docker.sock
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: DockerMachineTemplate
+metadata:
+  name: quick-start-default-worker-machinetemplate
+  namespace: default
+spec:
+  template:
+    spec:
+      extraMounts:
+      - containerPath: /var/run/docker.sock
+        hostPath: /var/run/docker.sock
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: DockerMachinePoolTemplate
+metadata:
+  name: quick-start-default-worker-machinepooltemplate
+  namespace: default
+spec:
+  template:
+    spec:
+      template: {}
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KubeadmConfigTemplate
+metadata:
+  name: quick-start-default-worker-bootstraptemplate
+  namespace: default
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          kubeletExtraArgs:
+          - name: eviction-hard
+            value: nodefs.available<0%,nodefs.inodesFree<0%,imagefs.available<0%
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: test-cluster
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+      - 192.168.0.0/16
+    serviceDomain: cluster.local
+    services:
+      cidrBlocks:
+      - 10.128.0.0/12
+  topology:
+    classRef:
+      name: quick-start
+    controlPlane:
+      replicas: 3
+    variables:
+    - name: imageRepository
+      value: ""
+    - name: etcdImageTag
+      value: ""
+    - name: coreDNSImageTag
+      value: ""
+    - name: podSecurityStandard
+      value:
+        audit: restricted
+        enabled: true
+        enforce: baseline
+        warn: restricted
+    version: 1.30.6
+    workers:
+      machineDeployments:
+      - class: default-worker
+        name: md-0
+        replicas: 2

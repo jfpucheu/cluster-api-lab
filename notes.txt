@@ -1,0 +1,257 @@
+root@test-cluster-7948n-vbpdr:/etc/kubernetes/manifests# cat etcd.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    kubeadm.kubernetes.io/etcd.advertise-client-urls: https://172.18.0.4:2379
+  creationTimestamp: null
+  labels:
+    component: etcd
+    tier: control-plane
+  name: etcd
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - etcd
+    - --advertise-client-urls=https://172.18.0.4:2379
+    - --cert-file=/etc/kubernetes/pki/etcd/server.crt
+    - --client-cert-auth=true
+    - --data-dir=/var/lib/etcd
+    - --experimental-initial-corrupt-check=true
+    - --experimental-watch-progress-notify-interval=5s
+    - --initial-advertise-peer-urls=https://172.18.0.4:2380
+    - --initial-cluster=test-cluster-7948n-66zph=https://172.18.0.6:2380,test-cluster-7948n-vbpdr=https://172.18.0.4:2380,test-cluster-7948n-n5787=https://172.18.0.5:2380
+    - --initial-cluster-state=existing
+    - --key-file=/etc/kubernetes/pki/etcd/server.key
+    - --listen-client-urls=https://127.0.0.1:2379,https://172.18.0.4:2379
+    - --listen-metrics-urls=http://127.0.0.1:2381
+    - --listen-peer-urls=https://172.18.0.4:2380
+    - --name=test-cluster-7948n-vbpdr
+    - --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt
+    - --peer-client-cert-auth=true
+    - --peer-key-file=/etc/kubernetes/pki/etcd/peer.key
+    - --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+    - --snapshot-count=10000
+    - --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+    image: registry.k8s.io/etcd:3.5.15-0
+    imagePullPolicy: IfNotPresent
+    livenessProbe:
+      failureThreshold: 8
+      httpGet:
+        host: 127.0.0.1
+        path: /health?exclude=NOSPACE&serializable=true
+        port: 2381
+        scheme: HTTP
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 15
+    name: etcd
+    resources:
+      requests:
+        cpu: 100m
+        memory: 100Mi
+    startupProbe:
+      failureThreshold: 24
+      httpGet:
+        host: 127.0.0.1
+        path: /health?serializable=false
+        port: 2381
+        scheme: HTTP
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 15
+    volumeMounts:
+    - mountPath: /var/lib/etcd
+      name: etcd-data
+    - mountPath: /etc/kubernetes/pki/etcd
+      name: etcd-certs
+  hostNetwork: true
+  priority: 2000001000
+  priorityClassName: system-node-critical
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/pki/etcd
+      type: DirectoryOrCreate
+    name: etcd-certs
+  - hostPath:
+      path: /var/lib/etcd
+      type: DirectoryOrCreate
+    name: etcd-data
+status: {}
+
+Hello
+
+Le champ etcd.external dans KubeadmControlPlane est immuable dans Cluster API. Les webhooks de validation bloquent toute modification directe de cette configuration. Voir la discussion :
+https://github.com/kubernetes-sigs/cluster-api/issues/2083
+https://hackmd.io/@etcdadm-cluster-api/Hkgbm85Ed
+J’ai essayé de bypasser le webhook :
+
+J’ai enlevé la règle ‘UPDATE’ mais ça ne vaut rien
+
+Est-ce que on peut ajouter un label sur dev10 pour skipper la validation du webhook ??
+
+Solution proposé:
+
+Créer un snapshot de l'etcd externe actuel (etcdctl snapshot save)
+Provisionner un nouveau cluster avec configuration stacked
+Utiliser preKubeadmCommands dans KubeadmConfigSpec pour restaurer le snapshot avant l'init
+# We start by creating snapshots of our external etcd
+ETCDCTL_API=3 etcdctl --endpoints=https://aws-ip:2379 \
+                      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                      --cert=/etc/kubernetes/pki/etcd/server.crt \
+                      --key=/etc/kubernetes/pki/etcd/server.key \
+snapshot save ./etcd-backup/etcdbackup.db
+ 
+# What kinda of changes there will be:
+# on two levels:
+# first on capi-openstack-templates (we change the behaviour the boostrapp of the control plane) - obviously on a new branch :)
+                # we need to remove the external section, add the local in KubeadmControlPlane file
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+    imageRepository: <imageNameTag>
+    imageTag : <????> # do even have our etcd image?
+ 
+preKubeadmCommands: (specifies a list of commands to be executed before kubeadm init/join
+      - curl -o /tmp/snapshot.db https://etcd-backup/snapshot-node1.db
+      - ETCDCTL_API=3 etcdctl snapshot restore /tmp/snapshot.db --data-dir /var/lib/etcd
+      - mv /var/lib/etcd/member /var/lib/etcd  # Adjust if needed
+      - chown -R etcd:etcd
+      - missing certs ??? # we will need to include all certs from old cluster
+# secondly, on capi-clusters-dev, since the cluster-vars-helm cm is injected into the kubeadm boostrapp a small change is needed
+                # change, under global.etcd:              
+                                # we remove this
+                                                external: true
+                                                endpoints: <list-of-ips>
+                # we add this 
+                                                local: {}
+
+
+
+preKubeadmCommands:
+    curl -L https://github.com/etcd-io/etcd/releases/download/v3.5.21/etcd-v3.5.21-linux-amd64.tar.gz -o /tmp/etcd-v3.5.21-linux-amd64.tar.gz
+    tar xzvf /tmp/etcd-v3.5.21-linux-amd64.tar.gz -C /usr/local/bin --strip-components=1
+    kubeadm init phase certs etcd-server
+    etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key --endpoints=https://192.168.64.14:2379, member add $(hostname) --peer-urls=https://$(hostname -I | awk '{print $1}'):2380
+    sed -i "/initial-cluster:/ s/$/, $(hostname)=https:\/\/$(hostname -I | awk '{print $1}'):2380/" /run/kubeadm/kubeadm.yaml
+    cat /run/kubeadm/kubeadm.yaml
+
+
+
+/home/core/etcd/certificates/ca.pem --cert-file /home/core/etcd/certificates/coreos.pem --key-file /home/core/etcd/certificates/coreos-key.pem
+
+
+                      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                      --cert=/etc/kubernetes/pki/etcd/server.crt \
+                      --key=/etc/kubernetes/pki/etcd/server.key \
+
+runcmd:
+  - 'kubeadm init --config /run/kubeadm/kubeadm.yaml  && echo success > /run/cluster-api/bootstrap-success.complete'%
+
+
+  kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/tigera-operator.yaml
+
+  kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/custom-resources.yaml
+
+
+Cluster/test-cluster                                        1/1       0          0      1           Available: False  NotAvailable  2m26s  * ControlPlaneAvailable: The list of etcd members does not match the list of Machines and Nodes
+
+etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key --endpoints=https://172.18.0.3:2379,https://172.18.0.5:2379 member list
+=https://172.18.0.3:2379,https://172.18.0.5:2379
+
+etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/tmp/etcd-client.crt --key=/tmp/etcd-client.key --endpoints=https://172.18.0.3:2379,  move-leader 62a2def59873b248
+
+node 1
+    - --experimental-initial-corrupt-check=true
+    - --experimental-watch-progress-notify-interval=5s
+    - --initial-advertise-peer-urls=https://172.18.0.4:2380
+    - --initial-cluster=test-cluster-99sts-tvcrh=https://172.18.0.4:2380
+    - --key-file=/etc/kubernetes/pki/etcd/server.key
+    - --listen-client-urls=https://127.0.0.1:2379,https://172.18.0.4:2379
+    - --listen-metrics-urls=http://127.0.0.1:2381
+    - --listen-peer-urls=https://172.18.0.4:2380
+
+
+node 2
+    - --experimental-initial-corrupt-check=true
+    - --experimental-watch-progress-notify-interval=5s
+    - --initial-advertise-peer-urls=https://172.18.0.5:2380
+    - --initial-cluster=test-cluster-99sts-lwg8z=https://172.18.0.5:2380,test-cluster-99sts-tvcrh=https://172.18.0.4:2380
+    - --initial-cluster-state=existing
+    - --key-file=/etc/kubernetes/pki/etcd/server.key
+    - --listen-client-urls=https://127.0.0.1:2379,https://172.18.0.5:2379
+    - --listen-metrics-urls=http://127.0.0.1:2381
+    - --listen-peer-urls=https://172.18.0.5:2380
+
+node 3
+    - --initial-advertise-peer-urls=https://172.18.0.6:2380
+    - --initial-cluster=test-cluster-99sts-lwg8z=https://172.18.0.5:2380,test-cluster-99sts-m7vxd=https://172.18.0.6:2380,test-cluster-99sts-tvcrh=https://172.18.0.4:2380
+    - --initial-cluster-state=existing
+    - --key-file=/etc/kubernetes/pki/etcd/server.key
+    - --listen-client-urls=https://127.0.0.1:2379,https://172.18.0.6:2379
+    - --listen-metrics-urls=http://127.0.0.1:2381
+    - --listen-peer-urls=https://172.18.0.6:2380
+
+
+etcdserver: rpc not supported for learner"}: etcdserver: rpc not supported for learner
+
+
+etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/tmp/etcd-client.crt --key=/tmp/etcd-client.key --endpoints=https://172.18.0.3:2379,https://172.18.0.5:2379  endpoint status  -w table
+
+
+ontrolPlaneAvailable: The list of etcd members does not match the list of Machines and Nodes
+
+
+etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/tmp/etcd-client.crt --key=/tmp/etcd-client.key --endpoints=https://172.18.0.3:2379,https://172.18.0.5:2379  move-leader 8bc84e9f4d51026a
+
+etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/tmp/etcd-client.crt --key=/tmp/etcd-client.key --endpoints=https://172.18.0.3:2379,https://172.18.0.5:2379 member remove 
+
+
+LEADER_ID=$(etcdctl --endpoints=$ENDPOINTS endpoint status --write-out=json | jq -r '.[] | select(.Status.leader == true) | .Status.leader')
+# Récupère l'ID du nœud local
+LOCAL_ID=$(etcdctl --endpoints=$LOCAL_ENDPOINT endpoint status --write-out=json | jq -r '.[0].Status.header.member_id')
+
+
+#!/bin/bash
+# Déplace le leader etcd vers le nœud local
+
+# === Configuration ===
+LOCAL_ENDPOINT="https://$(hostname -I | awk '{print $1}'):2379"
+ENDPOINTS="https://192.168.64.14:2379,https://192.168.64.15:2379,https://192.168.64.16:2379"
+ETCDCTL_API=3
+export ETCDCTL_API
+
+# Variables d'environnement pour le client etcd
+export ETCDCTL_CACERT=/etc/etcd/ssl/ca.pem
+export ETCDCTL_CERT=/etc/etcd/ssl/server.pem
+export ETCDCTL_KEY=/etc/etcd/ssl/server-key.pem
+
+echo "👉 Vérification du leader actuel..."
+etcdctl --endpoints=$ENDPOINTS endpoint status --write-out=table
+
+# Récupère l'ID du leader actuel
+LEADER_ID=$(etcdctl --endpoints=$ENDPOINTS endpoint status --write-out=json | jq -r '.[] | select(.Status.leader == true) | .Status.leader')
+# Récupère l'ID du nœud local
+LOCAL_ID=$(etcdctl --endpoints=$LOCAL_ENDPOINT endpoint status --write-out=json | jq -r '.[0].Status.header.member_id')
+
+echo "Nœud local ID: $LOCAL_ID"
+echo "Leader actuel ID: $LEADER_ID"
+
+# Si le leader est déjà local, rien à faire
+if [ "$LEADER_ID" == "$LOCAL_ID" ]; then
+  echo "✅ Ce nœud est déjà le leader."
+  exit 0
+fi
+
+# Déplacement du leader
+echo "⚙️ Transfert du leadership vers ce nœud..."
+etcdctl --endpoints=$ENDPOINTS move-leader $LOCAL_ID
+
+# Vérifie le résultat
+sleep 2
+echo "🔎 Nouveau statut :"
+etcdctl --endpoints=$ENDPOINTS endpoint status --write-out=table
