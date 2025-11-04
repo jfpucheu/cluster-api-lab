@@ -72,6 +72,27 @@ postkubeadm() {
     step "État cluster"
     etcdctl --endpoints="$ep" endpoint status --write-out=table
     
+
+   
+    step "Vérification synchronisation"
+    local max_attempts=30
+    local attempt=0
+    while ((attempt < max_attempts)); do
+        local old_rev=$(etcdctl --endpoints="https://$1:2379" endpoint status --write-out=simple | awk -F, '{print $4}' | tr -d ' ')
+        local new_rev=$(etcdctl --endpoints="$le" endpoint status --write-out=simple | awk -F, '{print $4}' | tr -d ' ')
+       
+        echo "Révision ancien: $old_rev | Révision nouveau: $new_rev"
+       
+        if [[ -n "$old_rev" && -n "$new_rev" && "$old_rev" == "$new_rev" ]]; then
+            log "Nœuds synchronisés (révision: $old_rev)"
+            break
+        fi
+       
+        ((attempt++))
+        [[ $attempt -eq $max_attempts ]] && err "Timeout: nœuds non synchronisés après 5 min"
+        sleep 10
+    done
+
     local lid=$(etcdctl --endpoints="$ep" endpoint status --write-out=simple | awk -F, '$5==" true"{print $2}'  | tr -d ' ')
     local oid=$(etcdctl --endpoints="$le" endpoint status --write-out=simple | awk -F, '{print $2}'  | tr -d ' ')
     
@@ -83,7 +104,7 @@ postkubeadm() {
         sleep 2
         etcdctl --endpoints="$ep" endpoint status --write-out=table
     fi
-    
+
     step "Suppression ancien membre"
     etcdctl --endpoints="$ep" member remove "$lid" || err "Suppression échouée"
     etcdctl --endpoints="$ep" endpoint status --write-out=table
