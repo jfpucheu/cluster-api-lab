@@ -1,5 +1,32 @@
 #!/bin/bash
 set -euo pipefail
+# Script d'installation etcdctl
+# Utilisé par etcd_migration.sh et etcd_restore_s3.sh
+
+readonly ETCD_VER="v3.5.16"
+readonly ETCD_URL="https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz"
+
+log() { echo -e "\033[0;32m✅ $1\033[0m"; }
+err() { echo -e "\033[0;31m❌ $1\033[0m" >&2; exit "${2:-1}"; }
+step() { echo -e "\n\033[1;33m==> $1\033[0m"; }
+
+# Vérifie si etcdctl est déjà installé avec la bonne version
+if command -v etcdctl &>/dev/null && [[ $(etcdctl version | head -n1 | awk '{print $3}') == "$ETCD_VER" ]]; then
+    log "etcdctl ${ETCD_VER} déjà installé"
+    exit 0
+fi
+
+step "Installation etcdctl ${ETCD_VER}"
+curl -fsSL "$ETCD_URL" -o /tmp/etcd.tar.gz || err "Téléchargement échoué"
+tar xzf /tmp/etcd.tar.gz -C /usr/local/bin --strip-components=1 "etcd-${ETCD_VER}-linux-amd64/etcdctl" "etcd-${ETCD_VER}-linux-amd64/etcd"
+rm -f /tmp/etcd.tar.gz
+log "etcd installé"
+- path: /etc/kubernetes/etcd_migration.sh
+owner: "root:root"
+permissions: "0744"
+content: |
+#!/bin/bash
+set -euo pipefail
 
 readonly KUBEADM_FILE="/run/kubeadm/kubeadm.yaml"
 log() { echo -e "\033[0;32m✅ $1\033[0m"; }
@@ -49,7 +76,7 @@ parse_endpoints() {
 
 setup_env() {
     export ETCDCTL_API=3 ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt \
-           ETCDCTL_CERT=/tmp/etcd-client.crt ETCDCTL_KEY=/tmp/etcd-client.key
+            ETCDCTL_CERT=/tmp/etcd-client.crt ETCDCTL_KEY=/tmp/etcd-client.key
 }
 
 gen_certs() {
@@ -102,8 +129,9 @@ postkubeadm() {
     step "Vérification synchronisation"
     local attempt=0
     while ((attempt < 30)); do
-        local old_rev=$(etcdctl --endpoints="https://${ETCD_IPS[0]}:2379" endpoint status --write-out=simple 2>/dev/null | awk -F, '{print $4}' | tr -d ' ' || echo "")
-        local new_rev=$(etcdctl --endpoints="$le" endpoint status --write-out=simple 2>/dev/null | awk -F, '{print $4}' | tr -d ' ' || echo "")
+        echo "attempt: $attempt"
+        local old_rev=$(etcdctl --endpoints="https://${ETCD_IPS[0]}:2379" endpoint status --write-out=simple 2>/dev/null | awk -F, '{print $8}' | tr -d ' ' || echo "")
+        local new_rev=$(etcdctl --endpoints="$le" endpoint status --write-out=simple 2>/dev/null | awk -F, '{print $8}' | tr -d ' ' || echo "")
         echo "Rev ancien: $old_rev | nouveau: $new_rev"
         [[ -n "$old_rev" && -n "$new_rev" && "$old_rev" == "$new_rev" ]] && { log "Synchro OK (rev: $old_rev)"; break; }
         ((attempt++))
