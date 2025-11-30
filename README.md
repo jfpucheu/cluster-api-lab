@@ -38,9 +38,9 @@ clusterctl init --infrastructure docker
 
 ### 4. Configurer etcd externe
 
-**Générer les certificats etcd:**
+**Démarrer etcd externe:**
 ```bash
-./gen_etcd_certificats.sh
+./manage_etcd.sh start
 ```
 
 **Importer les secrets dans Kubernetes:**
@@ -48,15 +48,11 @@ clusterctl init --infrastructure docker
 kubectl apply -f etcd/test-cluster-secret-bundle.yaml
 ```
 
-**Démarrer etcd externe:**
-```bash
-./start_etcd.sh
-```
 
 ### 5. Créer le cluster de test
 
 ```bash
-kubectl apply -f test-cluster-init-with-etcd.yaml
+kubectl apply -f cluster-migrate-external-etcd.yaml
 ```
 
 Attendre que le cluster soit prêt:
