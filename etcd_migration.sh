@@ -1,6 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-# Configuration
 readonly KUBEADM_FILE="/run/kubeadm/kubeadm.yaml"
 log() { echo -e "\033[0;32m✅ $1\033[0m"; }
 err() { echo -e "\033[0;31m❌ $1\033[0m" >&2; exit "${2:-1}"; }
@@ -81,7 +80,6 @@ gen_certs() {
         -CAcreateserial -out $ETCDCTL_CERT -days 1 -sha256 2>/dev/null
     log "Certificats OK"
 }
-
 prekubeadm() {
     [[ -f "$KUBEADM_FILE" ]] || { echo "Pas de $KUBEADM_FILE (normal si pas 1er CP)"; return 0; }
     local count=$(get_array_length ETCD_IPS)
@@ -90,14 +88,12 @@ prekubeadm() {
     /etc/kubernetes/install_etcd.sh
     local ip=$(hostname -I | awk '{print $1}')
     local hn=$(hostname)
-    # Construction de l'initial-cluster avec tous les anciens membres
     local initial_cluster=""
     for name in "${ETCD_NAMES[@]}"; do
         member_ip="${ETCD_ENDPOINTS[$name]}"
         [[ -n "$initial_cluster" ]] && initial_cluster+=","
         initial_cluster+="${name}=https://${member_ip}:2380"
     done
-    # Ajout du nouveau membre
     [[ -n "$initial_cluster" ]] && initial_cluster+=","
     initial_cluster+="${hn}=https://${ip}:2380"
     step "Ajout membre etcd: ${hn}"
@@ -106,7 +102,6 @@ prekubeadm() {
     log "Config pré-kubeadm OK. Démarrez kubeadm maintenant"
     log "Initial cluster: ${initial_cluster}"
 }
-
 postkubeadm() {
     [[ -f "$KUBEADM_FILE" ]] || { echo "Pas de $KUBEADM_FILE (normal si pas 1er CP)"; return 0; }
     local count=$(get_array_length ETCD_IPS)
@@ -120,17 +115,16 @@ postkubeadm() {
     kubectl get cm -n kube-system kubeadm-config -o yaml > /tmp/kubeadm-config.yaml
     sed -i '/^[[:space:]]*initial-cluster:/d' /tmp/kubeadm-config.yaml
     kubectl apply -f /tmp/kubeadm-config.yaml
-    step "État cluster initial"
     step "Vérification synchronisation avec anciens nœuds"
     local max_attempts=30
     local attempt=0
     while ((attempt < max_attempts)); do
         local first_old_ip="${ETCD_IPS[0]}"
-        local old_rev=$(etcdctl --endpoints="https://${first_old_ip}:2379" endpoint status --write-out=simple 2>/dev/null | awk -F, '{print $4}' | tr -d ' ' || echo "")
-        local new_rev=$(etcdctl --endpoints="$le" endpoint status --write-out=simple 2>/dev/null | awk -F, '{print $4}' | tr -d ' ' || echo "")
+        local old_rev=$(etcdctl --endpoints="https://${first_old_ip}:2379" endpoint status --write-out=json | jq '.[0].Status.header.revision' || echo "")
+        local new_rev=$(etcdctl --endpoints="$le" endpoint status --write-out=json | jq '.[0].Status.header.revision' || echo "")
         echo "Révision ancien: $old_rev | Révision nouveau: $new_rev"
-        if [[ -n "$old_rev" && -n "$new_rev" && "$old_rev" == "$new_rev" ]]; then
-            log "Nœuds synchronisés (révision: $old_rev)"
+        if [[ -n "$old_rev" && -n "$new_rev" && "$new_rev" -ge "$old_rev" ]]; then
+            log "Nœuds synchronisés (nouvelle révision $new_rev >= ancienne révision $old_rev)"
             break
         fi
         ((attempt++))
@@ -166,18 +160,14 @@ postkubeadm() {
     log "Attente stabilisation cluster (10s)..."
     sleep 10
     step "Suppression des anciens membres etcd"
-    # Récupérer tous les membres du cluster
     local members_output=$(etcdctl --endpoints="$le" member list --write-out=simple)
-    # Supprimer chaque ancien membre basé sur son IP
     for old_ip in "${ETCD_IPS[@]}"; do
-        # Trouver l'ID du membre correspondant à cette IP
         local member_id=$(echo "$members_output" | grep "$old_ip" | awk -F, '{print $1}' | tr -d ' ')
-
         if [[ -n "$member_id" ]]; then
             step "Suppression membre avec IP ${old_ip} (ID: ${member_id})"
             etcdctl --endpoints="$le" member remove "$member_id" || err "Suppression membre ${member_id} échouée"
             log "Membre ${member_id} supprimé"
-            sleep 5  # Pause entre suppressions
+            sleep 5
         else
             echo "⚠️  Aucun membre trouvé avec IP ${old_ip}"
         fi
@@ -187,17 +177,14 @@ postkubeadm() {
     etcdctl --endpoints="$le" member list --write-out=table
     log "Migration terminée - tous les anciens membres ont été supprimés"
 }
-
 main() {
     [[ $EUID -eq 0 ]] || err "Exécuter en root"
-
-    [[ $# -ge 1 ]] || err "Usage: $0 [prekubeadm|postkubeadm] <endpoint1> [endpoint2] [...]\n Format: name:ip ou simplement ip\n Ou bien paires consécutives name:etcd-01 ip:10.163.3.58\n Exemple: $0 prekubeadm etcd-01:10.163.3.58 etcd-02:10.163.3.113 etcd-03:10.163.3.178"
-
+    [[ $# -ge 1 ]] || err "Usage: $0 [prekubeadm|postkubeadm] <endpoint1> [endpoint2] [...]\n Format: name:ip ou simplement ip\n Exemple: $0 prekubeadm etcd-01:10.163.3.58 etcd-02:10.163.3.113"
     local action="$1"
     shift
     case "$action" in
         prekubeadm|postkubeadm)
-            [[ $# -ge 1 ]] || err "Les actions 'prekubeadm' et 'postkubeadm' nécessitent au moins un endpoint"
+            [[ $# -ge 1 ]] || err "Les actions nécessitent au moins un endpoint"
             parse_endpoints "$@"
             setup_env
             case "$action" in
