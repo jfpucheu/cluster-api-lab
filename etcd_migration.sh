@@ -118,17 +118,41 @@ postkubeadm() {
     step "Vérification synchronisation avec anciens nœuds"
     local max_attempts=30
     local attempt=0
+    local first_old_ip="${ETCD_IPS[0]}"
+    
     while ((attempt < max_attempts)); do
-        local first_old_ip="${ETCD_IPS[0]}"
-        local old_rev=$(etcdctl --endpoints="https://${first_old_ip}:2379" endpoint status --write-out=json | jq '.[0].Status.header.revision' || echo "")
-        local new_rev=$(etcdctl --endpoints="$le" endpoint status --write-out=json | jq '.[0].Status.header.revision' || echo "")
-        echo "Révision ancien: $old_rev | Révision nouveau: $new_rev"
-        if [[ -n "$old_rev" && -n "$new_rev" && "$new_rev" -ge "$old_rev" ]]; then
-            log "Nœuds synchronisés (nouvelle révision $new_rev >= ancienne révision $old_rev)"
-            break
+        # Récupération de la révision de l'ancien nœud avec gestion d'erreur
+        local old_rev_output
+        old_rev_output=$(etcdctl --endpoints="https://${first_old_ip}:2379" endpoint status --write-out=json 2>/dev/null) || old_rev_output=""
+        local old_rev=""
+        if [[ -n "$old_rev_output" ]]; then
+            old_rev=$(echo "$old_rev_output" | jq -r '.[0].Status.header.revision // empty' 2>/dev/null) || old_rev=""
         fi
+        
+        # Récupération de la révision du nouveau nœud avec gestion d'erreur
+        local new_rev_output
+        new_rev_output=$(etcdctl --endpoints="$le" endpoint status --write-out=json 2>/dev/null) || new_rev_output=""
+        local new_rev=""
+        if [[ -n "$new_rev_output" ]]; then
+            new_rev=$(echo "$new_rev_output" | jq -r '.[0].Status.header.revision // empty' 2>/dev/null) || new_rev=""
+        fi
+        
+        echo "Tentative $((attempt + 1))/$max_attempts - Révision ancien: ${old_rev:-N/A} | Révision nouveau: ${new_rev:-N/A}"
+        
+        # Vérification que les deux révisions sont des nombres valides
+        if [[ -n "$old_rev" && "$old_rev" =~ ^[0-9]+$ && -n "$new_rev" && "$new_rev" =~ ^[0-9]+$ ]]; then
+            if [[ "$new_rev" -ge "$old_rev" ]]; then
+                log "Nœuds synchronisés (nouvelle révision $new_rev >= ancienne révision $old_rev)"
+                break
+            fi
+        else
+            echo "⚠️  Révision non disponible ou invalide, nouvelle tentative..."
+        fi
+        
         ((attempt++))
-        [[ $attempt -eq $max_attempts ]] && err "Timeout: nœuds non synchronisés après 5 min"
+        if [[ $attempt -eq $max_attempts ]]; then
+            err "Timeout: nœuds non synchronisés après $((max_attempts * 10)) secondes"
+        fi
         sleep 10
     done
     # Récupération de l'ID du leader et du nouveau nœud
