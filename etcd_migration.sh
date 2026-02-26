@@ -149,7 +149,7 @@ postkubeadm() {
             echo "⚠️  Révision non disponible ou invalide, nouvelle tentative..."
         fi
         
-        ((attempt++))
+        ((attempt++)) || true
         if [[ $attempt -eq $max_attempts ]]; then
             err "Timeout: nœuds non synchronisés après $((max_attempts * 10)) secondes"
         fi
